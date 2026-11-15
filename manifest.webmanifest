@@ -1,0 +1,20 @@
+{
+  "name": "台南市開放資料檢視器",
+  "short_name": "台南資料",
+  "description": "載入、搜尋、分析並下載台南市政府開放資料 (CSV)",
+  "lang": "zh-TW",
+  "dir": "ltr",
+  "id": "/",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f0fdfa",
+  "theme_color": "#0d9488",
+  "categories": ["utilities", "productivity", "business"],
+  "icons": [
+    { "src": "/pwa/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/pwa/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/pwa/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

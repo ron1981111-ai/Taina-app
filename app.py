@@ -1,32 +1,43 @@
 """
-台南市開放資料檢視器 (Gradio)
-可部署於 Render / 本機 / Colab
+台南市開放資料檢視器 (Gradio + PWA + RWD)
+
+架構:FastAPI 作為外層 → 提供 manifest / service worker / 離線頁 / 圖示
+      Gradio 以 mount_gradio_app 掛載在根路徑 "/"
+啟動:python app.py   (Render 的 Start Command)
 """
 import os
 import tempfile
 import warnings
+from pathlib import Path
 
 import gradio as gr
 import pandas as pd
 import requests
 import urllib3
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ----------------------------------------------------------------------
-# 設定(可用環境變數覆寫)
+# 設定
 # ----------------------------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+PWA_DIR = BASE_DIR / "pwa"
+TMP_DIR = tempfile.gettempdir()
+REQUEST_TIMEOUT = 30
+
 DEFAULT_URL = os.getenv(
     "DATA_URL",
     "https://data.tainan.gov.tw/File/ResourceCsvDownload/6c16b2c8-92b6-49d9-98b5-02966462172c",  # 換連結
 )
-REQUEST_TIMEOUT = 30
-TMP_DIR = tempfile.gettempdir()
 
 
 # ----------------------------------------------------------------------
-# 資料載入
+# 資料處理
 # ----------------------------------------------------------------------
 def fetch_data(url: str) -> pd.DataFrame:
     """下載 CSV 並清理資料"""
@@ -102,14 +113,133 @@ def load_data(url):
 
 
 # ----------------------------------------------------------------------
-# 介面
+# PWA:<head> 注入內容
+# ----------------------------------------------------------------------
+HEAD = """
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0d9488">
+<meta name="application-name" content="台南資料">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="台南資料">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="apple-touch-icon" href="/pwa/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/pwa/icons/favicon-32.png">
+<script>
+(function () {
+  // 1) 註冊 Service Worker
+  if ("serviceWorker" in navigator) {
+    window.addEventListener("load", function () {
+      navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(function (e) {
+        console.warn("SW 註冊失敗", e);
+      });
+    });
+  }
+
+  var isStandalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone;
+  var isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  var deferredPrompt = null;
+  var installBtn = null;
+
+  function ready(fn) {
+    if (document.readyState !== "loading") fn(); else document.addEventListener("DOMContentLoaded", fn);
+  }
+
+  // 2) 安裝按鈕 + 離線提示列
+  ready(function () {
+    installBtn = document.createElement("button");
+    installBtn.id = "pwa-install";
+    installBtn.type = "button";
+    installBtn.textContent = "📲 安裝 App";
+    installBtn.addEventListener("click", function () {
+      if (deferredPrompt) {
+        deferredPrompt.prompt();
+        deferredPrompt.userChoice.finally(function () { deferredPrompt = null; installBtn.classList.remove("show"); });
+      } else if (isIOS) {
+        alert("iPhone / iPad 安裝方式:\\n點下方「分享」按鈕 → 選擇「加入主畫面」");
+      }
+    });
+    document.body.appendChild(installBtn);
+    if (isIOS && !isStandalone) installBtn.classList.add("show");
+
+    var banner = document.createElement("div");
+    banner.id = "net-banner";
+    banner.textContent = "⚠️ 目前離線,部分功能無法使用";
+    document.body.appendChild(banner);
+    function updateNet() { banner.classList.toggle("show", !navigator.onLine); }
+    window.addEventListener("online", updateNet);
+    window.addEventListener("offline", updateNet);
+    updateNet();
+  });
+
+  window.addEventListener("beforeinstallprompt", function (e) {
+    e.preventDefault();
+    deferredPrompt = e;
+    if (installBtn && !isStandalone) installBtn.classList.add("show");
+    else ready(function () { if (installBtn && !isStandalone) installBtn.classList.add("show"); });
+  });
+  window.addEventListener("appinstalled", function () {
+    if (installBtn) installBtn.classList.remove("show");
+  });
+})();
+</script>
+"""
+
+# ----------------------------------------------------------------------
+# RWD:樣式
 # ----------------------------------------------------------------------
 CSS = """
-.gradio-container {max-width: 1200px !important; margin: auto;}
-#title {text-align: center; padding: 18px 0 4px 0;}
-#title h1 {font-size: 2.1rem; margin-bottom: 4px;}
-#title p {color: #6b7280; margin: 0;}
-.status-box {padding: 10px 14px; border-radius: 10px;}
+/* ---------- 基本 ---------- */
+.gradio-container {
+  max-width: 1200px !important;
+  margin: 0 auto !important;
+  padding-left: max(16px, env(safe-area-inset-left)) !important;
+  padding-right: max(16px, env(safe-area-inset-right)) !important;
+  padding-bottom: max(16px, env(safe-area-inset-bottom)) !important;
+}
+#title { text-align: center; padding: 18px 0 6px; }
+#title h1 { font-size: clamp(1.4rem, 4.5vw, 2.1rem); margin: 0 0 4px; line-height: 1.25; }
+#title p  { color: #6b7280; margin: 0; font-size: clamp(.85rem, 2.6vw, 1rem); }
+.status-box { padding: 10px 14px; border-radius: 12px; }
+
+/* 觸控友善:按鈕最小 44px */
+button, .gr-button { min-height: 44px; }
+
+/* 表格:橫向捲動,避免撐破版面 */
+.gradio-container .table-wrap, .gradio-container [data-testid="dataframe"] { overflow-x: auto; }
+
+/* ---------- 安裝按鈕 / 離線提示 ---------- */
+#pwa-install {
+  display: none; position: fixed; z-index: 9999;
+  right: max(16px, env(safe-area-inset-right));
+  bottom: max(16px, env(safe-area-inset-bottom));
+  padding: 10px 18px; border: 0; border-radius: 999px;
+  background: #0d9488; color: #fff; font-weight: 600; font-size: .95rem;
+  box-shadow: 0 6px 18px rgba(13,148,136,.45); cursor: pointer;
+}
+#pwa-install.show { display: block; }
+#net-banner {
+  display: none; position: fixed; z-index: 9999; left: 0; right: 0; top: 0;
+  padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+  background: #f59e0b; color: #1f2937; text-align: center; font-size: .9rem;
+}
+#net-banner.show { display: block; }
+
+/* ---------- 平板 (<= 900px) ---------- */
+@media (max-width: 900px) {
+  .gradio-container { padding-left: 12px !important; padding-right: 12px !important; }
+}
+
+/* ---------- 手機 (<= 640px):Row 內元件改為直向堆疊 ---------- */
+@media (max-width: 640px) {
+  .row-stack { flex-wrap: wrap !important; gap: 10px !important; }
+  .row-stack > * { min-width: 100% !important; flex: 1 1 100% !important; }
+  #title { padding-top: 10px; }
+  #pwa-install { padding: 12px 20px; }
+}
+
+/* 已安裝成 App 時,不需要安裝按鈕 */
+@media (display-mode: standalone) { #pwa-install { display: none !important; } }
 """
 
 theme = gr.themes.Soft(
@@ -119,7 +249,10 @@ theme = gr.themes.Soft(
     font=[gr.themes.GoogleFont("Noto Sans TC"), "sans-serif"],
 )
 
-with gr.Blocks(theme=theme, css=CSS, title="台南開放資料檢視器") as demo:
+# ----------------------------------------------------------------------
+# Gradio 介面
+# ----------------------------------------------------------------------
+with gr.Blocks(theme=theme, css=CSS, head=HEAD, title="台南開放資料檢視器") as demo:
     df_state = gr.State(pd.DataFrame())
 
     gr.HTML(
@@ -127,7 +260,7 @@ with gr.Blocks(theme=theme, css=CSS, title="台南開放資料檢視器") as dem
         "<p>載入 → 搜尋 → 分析 → 下載,一站完成</p></div>"
     )
 
-    with gr.Row():
+    with gr.Row(elem_classes="row-stack"):
         url_box = gr.Textbox(
             label="CSV 資料連結", value=DEFAULT_URL, scale=5, lines=1,
             info="可替換成任何台南資料開放平台的 CSV 連結",
@@ -138,24 +271,24 @@ with gr.Blocks(theme=theme, css=CSS, title="台南開放資料檢視器") as dem
 
     with gr.Tabs():
         with gr.Tab("📋 資料表"):
-            with gr.Row():
+            with gr.Row(elem_classes="row-stack"):
                 keyword = gr.Textbox(label="關鍵字搜尋", placeholder="輸入文字,按 Enter 搜尋…", scale=3)
                 limit = gr.Slider(10, 1000, value=100, step=10, label="最多顯示筆數", scale=2)
             col_select = gr.Dropdown(choices=[], value=[], multiselect=True, label="顯示欄位")
             info = gr.Markdown()
-            table = gr.Dataframe(label="資料內容", interactive=False, wrap=True, max_height=500)
+            table = gr.Dataframe(label="資料內容", interactive=False, wrap=True, max_height=480)
             download = gr.File(label="⬇️ 下載目前篩選結果 (CSV)")
 
         with gr.Tab("📊 欄位摘要"):
-            summary = gr.Dataframe(label="欄位資訊", interactive=False, wrap=True)
+            summary = gr.Dataframe(label="欄位資訊", interactive=False, wrap=True, max_height=480)
 
         with gr.Tab("📈 快速圖表"):
-            with gr.Row():
+            with gr.Row(elem_classes="row-stack"):
                 chart_col = gr.Dropdown(choices=[], label="選擇欄位", scale=3)
                 top_n = gr.Slider(3, 30, value=10, step=1, label="顯示前 N 名", scale=2)
             plot = gr.BarPlot(
                 x="類別", y="數量", title="欄位值出現次數",
-                x_title="類別", y_title="數量", height=420,
+                x_title="類別", y_title="數量", height=380,
             )
 
     # ---------------- 事件綁定 ----------------
@@ -175,9 +308,54 @@ with gr.Blocks(theme=theme, css=CSS, title="台南開放資料檢視器") as dem
 
 demo.queue()
 
+# ----------------------------------------------------------------------
+# FastAPI 外層:PWA 必要路由(需在掛載 Gradio 之前註冊)
+# ----------------------------------------------------------------------
+app = FastAPI(title="Tainan Open Data PWA")
+
+
+@app.get("/manifest.webmanifest", include_in_schema=False)
+def manifest():
+    return FileResponse(
+        PWA_DIR / "manifest.webmanifest",
+        media_type="application/manifest+json",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/sw.js", include_in_schema=False)
+def service_worker():
+    # Service Worker 檔案不可被長時間快取,否則更新不會生效
+    return FileResponse(
+        PWA_DIR / "sw.js",
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+    )
+
+
+@app.get("/offline", include_in_schema=False)
+def offline_page():
+    return FileResponse(PWA_DIR / "offline.html", media_type="text/html")
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    return {"status": "ok"}
+
+
+# 圖示等靜態檔(用 /pwa 避免與 Gradio 自身的 /static 衝突)
+app.mount("/pwa", StaticFiles(directory=str(PWA_DIR)), name="pwa")
+
+# 掛載 Gradio 到根路徑
+app = gr.mount_gradio_app(app, demo, path="/")
+
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     # Render 會提供 PORT 環境變數,且必須綁定 0.0.0.0
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=int(os.getenv("PORT", 7860)),
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 7860)),
+        proxy_headers=True,          # 讓 https 轉發資訊正確(Render 在反向代理後)
+        forwarded_allow_ips="*",
     )
