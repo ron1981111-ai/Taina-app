@@ -17,22 +17,21 @@
 
 ```
 .
-├── app.py                      # FastAPI 外層 + Gradio 介面
+├── app.py                      # Gradio 介面 + FastAPI(提供 PWA 檔案)
 ├── requirements.txt
 ├── render.yaml                 # Render Blueprint(選用)
-├── make_icons.py               # 產生圖示的腳本(已附成品,可不執行)
-├── .gitignore
-├── README.md
-└── pwa/
-    ├── manifest.webmanifest    # PWA 應用程式描述
-    ├── sw.js                   # Service Worker
-    ├── offline.html            # 離線頁
-    └── icons/                  # 192 / 512 / maskable / apple-touch / favicon
+├── .python-version             # 指定 Python 版本 (3.11.9)
+├── make_icons.py               # 產生 PWA 圖示的工具(選用,需 pillow)
+└── static/
+    ├── manifest.webmanifest    # PWA 設定(名稱、圖示、主題色…)
+    ├── sw.js                   # Service Worker(由 /sw.js 提供,作用範圍為整站)
+    ├── offline.html            # 離線時顯示的頁面
+    └── icons/                  # 192 / 512 / maskable / apple-touch-icon
 ```
 
 ## 架構說明
 
-- `app.py` 以 FastAPI 為外層,提供 `/manifest.webmanifest`、`/sw.js`、`/offline`、`/pwa/*`,再用 `gr.mount_gradio_app` 把 Gradio 掛在根路徑 `/`。
+- `app.py` 以 FastAPI 為外層,提供 `/manifest.webmanifest`、`/sw.js`、`/offline`,並把 `static/` 資料夾掛在網址 `/pwa/*`(刻意不用 `/static`,以免蓋掉 Gradio 內建的 `/static` 路由),再用 `gr.mount_gradio_app` 把 Gradio 掛在根路徑 `/`。
 - Service Worker 必須由根路徑提供(`/sw.js`)才能控制整個網站範圍。
 - 快取策略:頁面導覽「網路優先、離線顯示 `/offline`」;靜態資源「stale-while-revalidate」;Gradio API 與下載檔案一律不快取。
 - 資料查詢必須連線,PWA 離線時只會顯示離線頁,不會顯示舊資料。
@@ -50,7 +49,7 @@ python app.py
 
 ## 部署到 Render
 
-1. 將專案推上 GitHub(`app.py`、`pwa/` 等放在 repo 根目錄)。
+1. 將專案推上 GitHub(`app.py`、`static/` 等放在 repo 根目錄)。
 2. Render → **New +** → **Web Service** → 選擇 repo。
 3. 設定:
 
@@ -61,7 +60,7 @@ python app.py
    | Start Command | `python app.py` ← 注意 python 與 app.py 中間是**空格** |
    | Health Check Path | `/healthz`(選用) |
 
-4. (選用)Environment 新增 `PYTHON_VERSION` = `3.11.9`。
+4. Python 版本由 repo 內的 `.python-version` 指定(3.11.9),不需另外設定環境變數。
 5. 或使用 Blueprint:New + → Blueprint,自動讀取 `render.yaml`。
 
 Render 預設提供 HTTPS,符合 PWA 需求。
@@ -77,7 +76,7 @@ Chrome DevTools → **Application** → 檢查 *Manifest* 與 *Service Workers*;
 
 ## 更新 Service Worker
 
-修改 `pwa/sw.js` 後,請把檔內 `VERSION` 改成新值(如 `v2`),舊快取會在啟用時自動清除。
+修改 `static/sw.js` 後,請把檔內 `VERSION` 改成新值(如 `v2`),舊快取會在啟用時自動清除。
 
 ## 環境變數(選用)
 

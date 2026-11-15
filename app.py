@@ -26,7 +26,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # 設定
 # ----------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-PWA_DIR = BASE_DIR / "pwa"
+STATIC_DIR = BASE_DIR / "static"
 TMP_DIR = tempfile.gettempdir()
 REQUEST_TIMEOUT = 30
 
@@ -317,7 +317,7 @@ app = FastAPI(title="Tainan Open Data PWA")
 @app.get("/manifest.webmanifest", include_in_schema=False)
 def manifest():
     return FileResponse(
-        PWA_DIR / "manifest.webmanifest",
+        STATIC_DIR / "manifest.webmanifest",
         media_type="application/manifest+json",
         headers={"Cache-Control": "public, max-age=3600"},
     )
@@ -327,7 +327,7 @@ def manifest():
 def service_worker():
     # Service Worker 檔案不可被長時間快取,否則更新不會生效
     return FileResponse(
-        PWA_DIR / "sw.js",
+        STATIC_DIR / "sw.js",
         media_type="application/javascript",
         headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
     )
@@ -335,7 +335,7 @@ def service_worker():
 
 @app.get("/offline", include_in_schema=False)
 def offline_page():
-    return FileResponse(PWA_DIR / "offline.html", media_type="text/html")
+    return FileResponse(STATIC_DIR / "offline.html", media_type="text/html")
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -343,8 +343,8 @@ def healthz():
     return {"status": "ok"}
 
 
-# 圖示等靜態檔(用 /pwa 避免與 Gradio 自身的 /static 衝突)
-app.mount("/pwa", StaticFiles(directory=str(PWA_DIR)), name="pwa")
+# 圖示等靜態檔:實體資料夾是 static/,但網址掛在 /pwa,避免蓋掉 Gradio 自身的 /static 路由
+app.mount("/pwa", StaticFiles(directory=str(STATIC_DIR)), name="pwa")  # 資料夾 static/ → 網址 /pwa/
 
 # 掛載 Gradio 到根路徑
 app = gr.mount_gradio_app(app, demo, path="/")
