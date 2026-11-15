@@ -16,7 +16,7 @@ import requests
 import urllib3
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 warnings.filterwarnings("ignore")
@@ -27,6 +27,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ----------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
+if not STATIC_DIR.is_dir():
+    print(f"[警告] 找不到 {STATIC_DIR},PWA 檔案不會生效。請確認 static/ 資料夾已推上 GitHub。")
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR = tempfile.gettempdir()
 REQUEST_TIMEOUT = 30
 
@@ -314,10 +317,17 @@ demo.queue()
 app = FastAPI(title="Tainan Open Data PWA")
 
 
+def _file_or_404(name: str, **kwargs):
+    path = STATIC_DIR / name
+    if not path.is_file():
+        return JSONResponse({"detail": f"{name} not found"}, status_code=404)
+    return FileResponse(path, **kwargs)
+
+
 @app.get("/manifest.webmanifest", include_in_schema=False)
 def manifest():
-    return FileResponse(
-        STATIC_DIR / "manifest.webmanifest",
+    return _file_or_404(
+        "manifest.webmanifest",
         media_type="application/manifest+json",
         headers={"Cache-Control": "public, max-age=3600"},
     )
@@ -326,8 +336,8 @@ def manifest():
 @app.get("/sw.js", include_in_schema=False)
 def service_worker():
     # Service Worker 檔案不可被長時間快取,否則更新不會生效
-    return FileResponse(
-        STATIC_DIR / "sw.js",
+    return _file_or_404(
+        "sw.js",
         media_type="application/javascript",
         headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
     )
@@ -335,7 +345,7 @@ def service_worker():
 
 @app.get("/offline", include_in_schema=False)
 def offline_page():
-    return FileResponse(STATIC_DIR / "offline.html", media_type="text/html")
+    return _file_or_404("offline.html", media_type="text/html")
 
 
 @app.get("/healthz", include_in_schema=False)
