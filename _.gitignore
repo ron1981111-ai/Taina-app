@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data01.csv
+filtered_data.csv
+.env
+venv/
+.venv/
