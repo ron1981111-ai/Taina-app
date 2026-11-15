@@ -1,13 +1,12 @@
 """
-台南市開放資料檢視器 (Gradio + PWA + RWD)
-
-架構:FastAPI 作為外層 → 提供 manifest / service worker / 離線頁 / 圖示
-      Gradio 以 mount_gradio_app 掛載在根路徑 "/"
-啟動:python app.py   (Render 的 Start Command)
+台南市開放資料瀏覽器 — Gradio + PWA + RWD
+FastAPI 負責提供 manifest / service worker / 離線頁，Gradio 掛載在根路徑 "/"。
+本機：python app.py        Render：uvicorn app:app --host 0.0.0.0 --port $PORT
 """
+import io
 import os
 import tempfile
-import warnings
+import time
 from pathlib import Path
 
 import gradio as gr
@@ -16,356 +15,289 @@ import requests
 import urllib3
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-warnings.filterwarnings("ignore")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ----------------------------------------------------------------------
-# 設定
-# ----------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-STATIC_DIR = BASE_DIR / "static"
-if not STATIC_DIR.is_dir():
-    print(f"[警告] 找不到 {STATIC_DIR},PWA 檔案不會生效。請確認 static/ 資料夾已推上 GitHub。")
-    STATIC_DIR.mkdir(parents=True, exist_ok=True)
-TMP_DIR = tempfile.gettempdir()
-REQUEST_TIMEOUT = 30
-
+BASE_DIR = Path(__file__).parent
+PWA_DIR = BASE_DIR / "pwa"
 DEFAULT_URL = os.getenv(
-    "DATA_URL",
+    "DEFAULT_CSV_URL",
     "https://data.tainan.gov.tw/File/ResourceCsvDownload/6c16b2c8-92b6-49d9-98b5-02966462172c",  # 換連結
 )
+CACHE_TTL = 600  # 秒；同一連結 10 分鐘內不重複下載
+_cache: dict[str, tuple[float, pd.DataFrame]] = {}
 
 
 # ----------------------------------------------------------------------
 # 資料處理
 # ----------------------------------------------------------------------
-def fetch_data(url: str) -> pd.DataFrame:
-    """下載 CSV 並清理資料"""
-    response = requests.get(url, verify=False, timeout=REQUEST_TIMEOUT)
+def fetch_csv(url: str) -> pd.DataFrame:
+    url = url.strip()
+    hit = _cache.get(url)
+    if hit and time.time() - hit[0] < CACHE_TTL:
+        return hit[1].copy()
+    response = requests.get(url, verify=False, timeout=30)
     response.raise_for_status()
-    csv_path = os.path.join(TMP_DIR, "data01.csv")
-    with open(csv_path, "wb") as f:
-        f.write(response.content)
-    df = pd.read_csv(csv_path, encoding="utf-8-sig")  # 繁體中文
-    return df.dropna().reset_index(drop=True)
+    df = pd.read_csv(io.BytesIO(response.content), encoding="utf-8-sig")  # 繁體中文
+    df = df.dropna().reset_index(drop=True)
+    _cache[url] = (time.time(), df)
+    return df.copy()
 
 
-def summary_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    return pd.DataFrame({
-        "欄位": df.columns,
-        "資料型態": [str(t) for t in df.dtypes],
-        "不重複值數量": [df[c].nunique() for c in df.columns],
-        "範例": [str(df[c].iloc[0]) for c in df.columns],
-    })
+def stat_cards(df: pd.DataFrame, shown: int | None = None) -> str:
+    shown = len(df) if shown is None else shown
+    items = [
+        ("符合條件的筆數", f"{shown:,}"),
+        ("資料總筆數", f"{len(df):,}"),
+        ("欄位數", f"{df.shape[1]}"),
+        ("數值欄位", f"{df.select_dtypes('number').shape[1]}"),
+    ]
+    cards = "".join(
+        f"<div class='stat'><div class='stat-num'>{v}</div><div class='stat-label'>{k}</div></div>"
+        for k, v in items
+    )
+    return f"<div class='stat-row'>{cards}</div>"
 
 
-def search_data(df, keyword, cols, limit):
-    if df is None or df.empty:
-        return pd.DataFrame(), "尚未載入資料", None
-
-    d = df[cols] if cols else df
-    if keyword and keyword.strip():
-        kw = keyword.strip()
-        mask = d.astype(str).apply(
-            lambda s: s.str.contains(kw, case=False, na=False, regex=False)
-        ).any(axis=1)
-        d = d[mask]
-
-    total = len(d)
-    shown = d.head(int(limit))
-    export_path = os.path.join(TMP_DIR, "filtered_data.csv")
-    shown.to_csv(export_path, index=False, encoding="utf-8-sig")
-    info = f"🔎 符合條件 **{total:,}** 筆,目前顯示前 **{len(shown):,}** 筆"
-    return shown, info, export_path
+def category_counts(df: pd.DataFrame, col: str, top: int = 12) -> pd.DataFrame:
+    counts = df[col].astype(str).value_counts().head(top).reset_index()
+    counts.columns = [col, "筆數"]
+    return counts
 
 
-def make_chart(df, col, top_n):
-    if df is None or df.empty or not col or col not in df.columns:
-        return pd.DataFrame({"類別": [], "數量": []})
-    vc = df[col].astype(str).value_counts().head(int(top_n)).reset_index()
-    vc.columns = ["類別", "數量"]
-    return vc
-
-
-def load_data(url):
-    try:
-        df = fetch_data(url.strip())
-    except Exception as e:
-        raise gr.Error(f"資料載入失敗:{e}")
-
-    cols = list(df.columns)
-    status = f"✅ 載入成功:共 **{len(df):,}** 筆資料、**{len(cols)}** 個欄位"
-    table, info, file = search_data(df, "", cols, 100)
-    first = cols[0] if cols else None
-    return (
-        df,
-        status,
-        gr.update(choices=cols, value=cols),
-        gr.update(choices=cols, value=first),
-        table,
-        info,
-        file,
-        summary_df(df),
-        make_chart(df, first, 10),
+def update_chart(df, col):
+    if df is None or not col:
+        return gr.BarPlot(value=pd.DataFrame({"類別": [], "筆數": []}), x="類別", y="筆數")
+    return gr.BarPlot(
+        value=category_counts(df, col), x=col, y="筆數", x_title=col, y_title="筆數", height=380
     )
 
 
 # ----------------------------------------------------------------------
-# PWA:<head> 注入內容
+# 事件
 # ----------------------------------------------------------------------
+def load_data(url):
+    try:
+        df = fetch_csv(url)
+    except Exception as e:
+        raise gr.Error(f"下載失敗：{e}。請確認連結是否正確，或稍後再試。")
+    cols = list(df.columns)
+    cat_cols = [c for c in cols if df[c].nunique() <= max(30, len(df) // 2)] or cols
+    gr.Info(f"已載入 {len(df):,} 筆資料")
+    return (
+        df,
+        stat_cards(df),
+        df,
+        gr.update(choices=cols, value=cols),
+        gr.update(choices=cat_cols, value=cat_cols[0]),
+        update_chart(df, cat_cols[0]),
+        df.describe(include="all").T.reset_index().rename(columns={"index": "欄位"}),
+        None,
+    )
+
+
+def apply_filter(df, keyword, cols):
+    if df is None:
+        raise gr.Error("請先按「載入資料」。")
+    out = df
+    kw = (keyword or "").strip()
+    if kw:
+        mask = out.astype(str).apply(lambda s: s.str.contains(kw, case=False, regex=False)).any(axis=1)
+        out = out[mask]
+    if cols:
+        out = out[[c for c in cols if c in out.columns]]
+    path = None
+    if len(out):
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv", prefix="tainan_")
+        out.to_csv(tmp.name, index=False, encoding="utf-8-sig")  # BOM：Excel 開啟不亂碼
+        path = tmp.name
+    return stat_cards(df, len(out)), out, path
+
+
+def reset(df):
+    if df is None:
+        return "", gr.update(), EMPTY_STATS, None, None
+    return "", gr.update(value=list(df.columns)), stat_cards(df), df, None
+
+
+# ----------------------------------------------------------------------
+# 外觀（RWD：手機單欄、平板雙欄、桌面完整排版）
+# ----------------------------------------------------------------------
+theme = gr.themes.Base(
+    primary_hue=gr.themes.Color(
+        c50="#eef3fb", c100="#d9e4f5", c200="#b5c9ea", c300="#8aa9db", c400="#5f86c8",
+        c500="#3f68ad", c600="#2e5190", c700="#243f73", c800="#1d3258", c900="#16253f", c950="#0e182a",
+    ),
+    secondary_hue="teal",
+    neutral_hue="slate",
+    radius_size=gr.themes.sizes.radius_lg,
+    font=[gr.themes.GoogleFont("Noto Sans TC"), "ui-sans-serif", "system-ui", "sans-serif"],
+).set(
+    button_primary_background_fill="linear-gradient(135deg,#243f73,#2f7f86)",
+    button_primary_background_fill_hover="linear-gradient(135deg,#1d3258,#256a70)",
+    button_primary_text_color="white",
+)
+
+CSS = """
+.gradio-container {
+  max-width: 1180px !important; margin: auto;
+  padding-left: max(12px, env(safe-area-inset-left)) !important;
+  padding-right: max(12px, env(safe-area-inset-right)) !important;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.hero {
+  padding: clamp(20px, 4vw, 36px); border-radius: 22px; color: #fff;
+  background:
+    radial-gradient(circle at 88% 20%, rgba(255,255,255,.14) 0, transparent 38%),
+    linear-gradient(135deg, #1d3258 0%, #243f73 55%, #2f7f86 100%);
+}
+.hero h1 { margin: 0 0 8px; font-size: clamp(1.4rem, 4.5vw, 2rem); font-weight: 700; color: #fff; }
+.hero p  { margin: 0; font-size: clamp(.92rem, 2.4vw, 1rem); line-height: 1.7; color: rgba(255,255,255,.85); }
+
+.stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.stat { background: var(--background-fill-primary); border: 1px solid var(--border-color-primary);
+        border-radius: 16px; padding: 14px 16px; min-width: 0; }
+.stat-num { font-size: clamp(1.25rem, 3.6vw, 1.7rem); font-weight: 700; color: #2e5190; line-height: 1.2; }
+.dark .stat-num { color: #8aa9db; }
+.stat-label { margin-top: 4px; font-size: .82rem; color: var(--body-text-color-subdued); }
+
+.foot { text-align: center; color: var(--body-text-color-subdued); font-size: .85rem; padding: 6px 0 14px; }
+button:focus-visible, input:focus-visible { outline: 3px solid #2f7f86 !important; outline-offset: 2px; }
+
+/* 平板 */
+@media (max-width: 900px) { .stat-row { grid-template-columns: repeat(2, 1fr); } }
+/* 手機：按鈕撐滿、表格可橫向捲動、觸控目標放大 */
+@media (max-width: 640px) {
+  .gradio-container { padding-top: 8px !important; }
+  button { min-height: 46px; }
+  input, textarea { font-size: 16px !important; }  /* 避免 iOS 聚焦時自動放大 */
+  .stat { padding: 12px; border-radius: 14px; }
+  table { font-size: .85rem; }
+}
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+
+/* PWA 安裝按鈕 */
+#pwa-install {
+  position: fixed; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 50;
+  padding: 12px 18px; border: 0; border-radius: 999px; cursor: pointer; color: #fff; font: 600 .95rem/1 inherit;
+  background: linear-gradient(135deg,#243f73,#2f7f86); box-shadow: 0 6px 20px rgba(22,37,63,.3);
+}
+"""
+
+# <head>：manifest、主題色、iOS 支援、Service Worker 註冊、安裝按鈕
 HEAD = """
 <link rel="manifest" href="/manifest.webmanifest">
-<meta name="theme-color" content="#0d9488">
-<meta name="application-name" content="台南資料">
-<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#243f73">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="台南資料">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
-<link rel="apple-touch-icon" href="/pwa/icons/apple-touch-icon.png">
-<link rel="icon" type="image/png" sizes="32x32" href="/pwa/icons/favicon-32.png">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="/pwa/icon-192.png">
+<link rel="icon" type="image/png" href="/pwa/icon-192.png">
 <script>
-(function () {
-  // 1) 註冊 Service Worker
-  if ("serviceWorker" in navigator) {
-    window.addEventListener("load", function () {
-      navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(function (e) {
-        console.warn("SW 註冊失敗", e);
-      });
-    });
-  }
-
-  var isStandalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone;
-  var isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
-  var deferredPrompt = null;
-  var installBtn = null;
-
-  function ready(fn) {
-    if (document.readyState !== "loading") fn(); else document.addEventListener("DOMContentLoaded", fn);
-  }
-
-  // 2) 安裝按鈕 + 離線提示列
-  ready(function () {
-    installBtn = document.createElement("button");
-    installBtn.id = "pwa-install";
-    installBtn.type = "button";
-    installBtn.textContent = "📲 安裝 App";
-    installBtn.addEventListener("click", function () {
-      if (deferredPrompt) {
-        deferredPrompt.prompt();
-        deferredPrompt.userChoice.finally(function () { deferredPrompt = null; installBtn.classList.remove("show"); });
-      } else if (isIOS) {
-        alert("iPhone / iPad 安裝方式:\\n點下方「分享」按鈕 → 選擇「加入主畫面」");
-      }
-    });
-    document.body.appendChild(installBtn);
-    if (isIOS && !isStandalone) installBtn.classList.add("show");
-
-    var banner = document.createElement("div");
-    banner.id = "net-banner";
-    banner.textContent = "⚠️ 目前離線,部分功能無法使用";
-    document.body.appendChild(banner);
-    function updateNet() { banner.classList.toggle("show", !navigator.onLine); }
-    window.addEventListener("online", updateNet);
-    window.addEventListener("offline", updateNet);
-    updateNet();
-  });
-
-  window.addEventListener("beforeinstallprompt", function (e) {
-    e.preventDefault();
-    deferredPrompt = e;
-    if (installBtn && !isStandalone) installBtn.classList.add("show");
-    else ready(function () { if (installBtn && !isStandalone) installBtn.classList.add("show"); });
-  });
-  window.addEventListener("appinstalled", function () {
-    if (installBtn) installBtn.classList.remove("show");
-  });
-})();
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => {}));
+}
+let deferredPrompt;
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault(); deferredPrompt = e;
+  if (document.getElementById("pwa-install")) return;
+  const b = document.createElement("button");
+  b.id = "pwa-install"; b.textContent = "安裝 App";
+  b.onclick = async () => { b.remove(); deferredPrompt.prompt(); await deferredPrompt.userChoice; deferredPrompt = null; };
+  document.body.appendChild(b);
+});
+window.addEventListener("appinstalled", () => document.getElementById("pwa-install")?.remove());
 </script>
 """
 
-# ----------------------------------------------------------------------
-# RWD:樣式
-# ----------------------------------------------------------------------
-CSS = """
-/* ---------- 基本 ---------- */
-.gradio-container {
-  max-width: 1200px !important;
-  margin: 0 auto !important;
-  padding-left: max(16px, env(safe-area-inset-left)) !important;
-  padding-right: max(16px, env(safe-area-inset-right)) !important;
-  padding-bottom: max(16px, env(safe-area-inset-bottom)) !important;
-}
-#title { text-align: center; padding: 18px 0 6px; }
-#title h1 { font-size: clamp(1.4rem, 4.5vw, 2.1rem); margin: 0 0 4px; line-height: 1.25; }
-#title p  { color: #6b7280; margin: 0; font-size: clamp(.85rem, 2.6vw, 1rem); }
-.status-box { padding: 10px 14px; border-radius: 12px; }
-
-/* 觸控友善:按鈕最小 44px */
-button, .gr-button { min-height: 44px; }
-
-/* 表格:橫向捲動,避免撐破版面 */
-.gradio-container .table-wrap, .gradio-container [data-testid="dataframe"] { overflow-x: auto; }
-
-/* ---------- 安裝按鈕 / 離線提示 ---------- */
-#pwa-install {
-  display: none; position: fixed; z-index: 9999;
-  right: max(16px, env(safe-area-inset-right));
-  bottom: max(16px, env(safe-area-inset-bottom));
-  padding: 10px 18px; border: 0; border-radius: 999px;
-  background: #0d9488; color: #fff; font-weight: 600; font-size: .95rem;
-  box-shadow: 0 6px 18px rgba(13,148,136,.45); cursor: pointer;
-}
-#pwa-install.show { display: block; }
-#net-banner {
-  display: none; position: fixed; z-index: 9999; left: 0; right: 0; top: 0;
-  padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
-  background: #f59e0b; color: #1f2937; text-align: center; font-size: .9rem;
-}
-#net-banner.show { display: block; }
-
-/* ---------- 平板 (<= 900px) ---------- */
-@media (max-width: 900px) {
-  .gradio-container { padding-left: 12px !important; padding-right: 12px !important; }
-}
-
-/* ---------- 手機 (<= 640px):Row 內元件改為直向堆疊 ---------- */
-@media (max-width: 640px) {
-  .row-stack { flex-wrap: wrap !important; gap: 10px !important; }
-  .row-stack > * { min-width: 100% !important; flex: 1 1 100% !important; }
-  #title { padding-top: 10px; }
-  #pwa-install { padding: 12px 20px; }
-}
-
-/* 已安裝成 App 時,不需要安裝按鈕 */
-@media (display-mode: standalone) { #pwa-install { display: none !important; } }
+HERO = """
+<div class="hero">
+  <h1>台南市開放資料瀏覽器</h1>
+  <p>貼上資料集的 CSV 連結，載入後即可搜尋、挑選欄位、查看統計圖表，並下載整理好的檔案。</p>
+</div>
 """
-
-theme = gr.themes.Soft(
-    primary_hue="teal",
-    secondary_hue="cyan",
-    neutral_hue="slate",
-    font=[gr.themes.GoogleFont("Noto Sans TC"), "sans-serif"],
-)
+EMPTY_STATS = "<div class='stat-row'><div class='stat'><div class='stat-num'>–</div><div class='stat-label'>尚未載入資料</div></div></div>"
 
 # ----------------------------------------------------------------------
 # Gradio 介面
 # ----------------------------------------------------------------------
-with gr.Blocks(theme=theme, css=CSS, head=HEAD, title="台南開放資料檢視器") as demo:
-    df_state = gr.State(pd.DataFrame())
+with gr.Blocks(theme=theme, css=CSS, head=HEAD, title="台南開放資料瀏覽器") as demo:
+    state = gr.State(None)
+    gr.HTML(HERO)
 
-    gr.HTML(
-        "<div id='title'><h1>🏙️ 台南市開放資料檢視器</h1>"
-        "<p>載入 → 搜尋 → 分析 → 下載,一站完成</p></div>"
-    )
-
-    with gr.Row(elem_classes="row-stack"):
-        url_box = gr.Textbox(
-            label="CSV 資料連結", value=DEFAULT_URL, scale=5, lines=1,
-            info="可替換成任何台南資料開放平台的 CSV 連結",
+    with gr.Row():
+        url_in = gr.Textbox(
+            value=DEFAULT_URL, label="CSV 連結", scale=5, lines=1, max_lines=1,
+            placeholder="https://data.tainan.gov.tw/File/ResourceCsvDownload/...",
         )
-        load_btn = gr.Button("📥 載入資料", variant="primary", scale=1, size="lg")
+        load_btn = gr.Button("載入資料", variant="primary", scale=1, size="lg", min_width=140)
 
-    status = gr.Markdown("尚未載入資料,請按「載入資料」", elem_classes="status-box")
+    stats = gr.HTML(EMPTY_STATS)
 
     with gr.Tabs():
-        with gr.Tab("📋 資料表"):
-            with gr.Row(elem_classes="row-stack"):
-                keyword = gr.Textbox(label="關鍵字搜尋", placeholder="輸入文字,按 Enter 搜尋…", scale=3)
-                limit = gr.Slider(10, 1000, value=100, step=10, label="最多顯示筆數", scale=2)
-            col_select = gr.Dropdown(choices=[], value=[], multiselect=True, label="顯示欄位")
-            info = gr.Markdown()
-            table = gr.Dataframe(label="資料內容", interactive=False, wrap=True, max_height=480)
-            download = gr.File(label="⬇️ 下載目前篩選結果 (CSV)")
+        with gr.Tab("資料表"):
+            with gr.Row():
+                keyword = gr.Textbox(label="關鍵字搜尋", placeholder="輸入區名、路名…", scale=2, min_width=240)
+                cols_pick = gr.Dropdown(label="顯示欄位", choices=[], multiselect=True, scale=3, min_width=240)
+            with gr.Row():
+                search_btn = gr.Button("套用篩選", variant="primary", min_width=120)
+                reset_btn = gr.Button("清除條件", min_width=120)
+            table = gr.Dataframe(label="資料內容", interactive=False, wrap=True, max_height=520)
+            download = gr.File(label="下載篩選結果（CSV）", interactive=False)
 
-        with gr.Tab("📊 欄位摘要"):
-            summary = gr.Dataframe(label="欄位資訊", interactive=False, wrap=True, max_height=480)
+        with gr.Tab("圖表"):
+            cat_pick = gr.Dropdown(label="統計欄位（顯示前 12 名）", choices=[])
+            chart = gr.BarPlot(x=None, y=None, label="各類別筆數", height=380)
 
-        with gr.Tab("📈 快速圖表"):
-            with gr.Row(elem_classes="row-stack"):
-                chart_col = gr.Dropdown(choices=[], label="選擇欄位", scale=3)
-                top_n = gr.Slider(3, 30, value=10, step=1, label="顯示前 N 名", scale=2)
-            plot = gr.BarPlot(
-                x="類別", y="數量", title="欄位值出現次數",
-                x_title="類別", y_title="數量", height=380,
-            )
+        with gr.Tab("欄位摘要"):
+            summary = gr.Dataframe(label="describe() 統計摘要", interactive=False, wrap=True)
 
-    # ---------------- 事件綁定 ----------------
-    load_outputs = [df_state, status, col_select, chart_col, table, info, download, summary, plot]
-    load_btn.click(load_data, url_box, load_outputs)
-    demo.load(load_data, url_box, load_outputs)
+    gr.HTML("<div class='foot'>資料來源：臺南市政府資料開放平台</div>")
 
-    s_in = [df_state, keyword, col_select, limit]
-    s_out = [table, info, download]
-    keyword.submit(search_data, s_in, s_out)
-    col_select.change(search_data, s_in, s_out)
-    limit.release(search_data, s_in, s_out)
-
-    c_in = [df_state, chart_col, top_n]
-    chart_col.change(make_chart, c_in, plot)
-    top_n.release(make_chart, c_in, plot)
+    load_btn.click(load_data, url_in, [state, stats, table, cols_pick, cat_pick, chart, summary, download])
+    search_btn.click(apply_filter, [state, keyword, cols_pick], [stats, table, download])
+    keyword.submit(apply_filter, [state, keyword, cols_pick], [stats, table, download])
+    reset_btn.click(reset, state, [keyword, cols_pick, stats, table, download])
+    cat_pick.change(update_chart, [state, cat_pick], chart)
 
 demo.queue()
 
 # ----------------------------------------------------------------------
-# FastAPI 外層:PWA 必要路由(需在掛載 Gradio 之前註冊)
+# FastAPI：PWA 檔案必須放在根路徑，Service Worker 才能控制整站
+# （路由要在 mount_gradio_app 之前註冊）
 # ----------------------------------------------------------------------
 app = FastAPI(title="Tainan Open Data PWA")
 
 
-def _file_or_404(name: str, **kwargs):
-    path = STATIC_DIR / name
-    if not path.is_file():
-        return JSONResponse({"detail": f"{name} not found"}, status_code=404)
-    return FileResponse(path, **kwargs)
-
-
-@app.get("/manifest.webmanifest", include_in_schema=False)
+@app.get("/manifest.webmanifest")
 def manifest():
-    return _file_or_404(
-        "manifest.webmanifest",
-        media_type="application/manifest+json",
-        headers={"Cache-Control": "public, max-age=3600"},
-    )
+    return FileResponse(PWA_DIR / "manifest.webmanifest", media_type="application/manifest+json")
 
 
-@app.get("/sw.js", include_in_schema=False)
+@app.get("/sw.js")
 def service_worker():
-    # Service Worker 檔案不可被長時間快取,否則更新不會生效
-    return _file_or_404(
-        "sw.js",
+    return FileResponse(
+        PWA_DIR / "sw.js",
         media_type="application/javascript",
-        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+        headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"},
     )
 
 
-@app.get("/offline", include_in_schema=False)
-def offline_page():
-    return _file_or_404("offline.html", media_type="text/html")
+@app.get("/offline.html")
+def offline():
+    return FileResponse(PWA_DIR / "offline.html", media_type="text/html")
 
 
-@app.get("/healthz", include_in_schema=False)
+@app.get("/healthz")
 def healthz():
-    return {"status": "ok"}
+    return PlainTextResponse("ok")
 
 
-# 圖示等靜態檔:實體資料夾是 static/,但網址掛在 /pwa,避免蓋掉 Gradio 自身的 /static 路由
-app.mount("/pwa", StaticFiles(directory=str(STATIC_DIR)), name="pwa")  # 資料夾 static/ → 網址 /pwa/
-
-# 掛載 Gradio 到根路徑
+app.mount("/pwa", StaticFiles(directory=PWA_DIR), name="pwa")
 app = gr.mount_gradio_app(app, demo, path="/")
 
-# ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # Render 會提供 PORT 環境變數,且必須綁定 0.0.0.0
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", 7860)),
-        proxy_headers=True,          # 讓 https 轉發資訊正確(Render 在反向代理後)
-        forwarded_allow_ips="*",
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "7860")))
